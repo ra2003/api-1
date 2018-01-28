@@ -1,38 +1,24 @@
-import requests
-import json
 import hashlib
 import hmac
+import json
+import logging
+import sys
+import time
 import urllib
 import uuid
-import sys
-import logging
-import time
 from random import randint
+
+import requests
 from tqdm import tqdm
 
 from . import config
-from .api_photo import configurePhoto
-from .api_photo import uploadPhoto
-from .api_photo import downloadPhoto
-
-from .api_video import configureVideo
-from .api_video import uploadVideo
-
-from .api_search import fbUserSearch
-from .api_search import searchUsers
-from .api_search import searchUsername
-from .api_search import searchTags
-from .api_search import searchLocation
-
-from .api_profile import removeProfilePicture
-from .api_profile import setPrivateAccount
-from .api_profile import setPublicAccount
-from .api_profile import getProfileData
-from .api_profile import editProfile
-from .api_profile import setNameAndPhone
-
-from .prepare import get_credentials
-from .prepare import delete_credentials
+from .api_photo import configurePhoto, downloadPhoto, uploadPhoto
+from .api_profile import (editProfile, getProfileData, removeProfilePicture,
+                          setNameAndPhone, setPrivateAccount, setPublicAccount)
+from .api_search import (fbUserSearch, searchLocation, searchTags,
+                         searchUsername, searchUsers)
+from .api_video import configureVideo, uploadVideo
+from .prepare import delete_credentials, get_credentials
 
 try:
     from urllib.parse import urlparse
@@ -49,14 +35,22 @@ class API(object):
         self.isLoggedIn = False
         self.LastResponse = None
         self.total_requests = 0
+        self.last_login = 0
+        self.last_experiments_time = 0
+
+        self.username = None
+        self.password = None
+        self.user_id = None
+        self.session = None
+
+        self._token = None
 
         # handle logging
         self.logger = logging.getLogger('[instabot]')
         self.logger.setLevel(logging.DEBUG)
         logging.basicConfig(format='%(asctime)s %(message)s',
                             filename='instabot.log',
-                            level=logging.INFO
-                            )
+                            level=logging.INFO)
         ch = logging.StreamHandler()
         ch.setLevel(logging.DEBUG)
         formatter = logging.Formatter(
@@ -64,10 +58,30 @@ class API(object):
         ch.setFormatter(formatter)
         self.logger.addHandler(ch)
 
+    @property
+    def token(self):
+        """
+        Getting token from cookies
+        """
+        if not self.session or self._token:
+            return None
+        if self._token:
+            return self._token
+        cookie = self.session.cookies
+        return cookie.get('csrftoken', domain='i.instagram.com')
+
+    @token.setter
+    def token(self, value):
+        self._token = value
+
     def setUser(self, username, password):
         self.username = username
         self.password = password
         self.uuid = self.generateUUID(True)
+        self.advertising_id = self.generateUUID(True)
+        self.phone_id = self.generateUUID(True)
+        self.device_id = self.generateDeviceId()
+        self.token = None
 
     def login(self, username=None, password=None, force=False, proxy=None):
         if password is None:
@@ -76,7 +90,7 @@ class API(object):
         m = hashlib.md5()
         m.update(username.encode('utf-8') + password.encode('utf-8'))
         self.proxy = proxy
-        self.device_id = self.generateDeviceId(m.hexdigest())
+        self.device_id = self.generateDeviceId()
         self.setUser(username, password)
 
         if (not self.isLoggedIn or force):
@@ -177,6 +191,114 @@ class API(object):
             'experiments': config.EXPERIMENTS
         })
         return self.SendRequest('qe/sync/', self.generateSignature(data))
+
+    def send_pre_login_flow(self):
+        self.sync_device_features(True)
+        self.read_msisdn_header()
+        self.log_attribution()
+
+    def read_msisdn_header(self, subno_key=None):
+        data = {
+            'device_id': self.uuid,
+            '_csrftoken': self.token
+        }
+
+        if subno_key:
+            data['subno_key'] = subno_key
+        return self.SendRequest('accounts/read_msisdn_header/', data, True)
+
+    def log_attribution(self):
+        data = {
+            'adid': self.advertising_id
+        }
+        return self.SendRequest('attribution/log_attribution/', data, True)
+
+    def login2(self, username, password, force_login=False, refresh_interval=1800):
+        # Switch the currently active user/pass if the details are different
+        if self.username != username or self.password != password:
+            self.setUser(username, password)
+
+        # Perform a full relogin if necessary
+        if force_login or not self.isLoggedIn:
+            self.session = requests.Session()
+            self.send_pre_login_flow()
+
+            login_data = {
+                'phone_id': self.phone_id,
+                '_csrftoken': self.token,
+                'username': self.username,
+                'adid': self.advertising_id,
+                'guid': self.uuid,
+                'device_id': self.device_id,
+                'password': self.password,
+                'login_attempt_count': 0
+            }
+
+            response = self.SendRequest('accounts/login/', login_data)
+
+            # TODO: Check on two factor requires
+            self.update_login_state(self.LastJson)
+            self.send_login_flow(True, refresh_interval)
+
+            return response
+
+    def send_login_flow(self, just_logged_in, app_refresh_interval=1800):
+        if not isinstance(app_refresh_interval, int) or app_refresh_interval < 0:
+            raise Exception("Instagram's app state refresh interval must be a positive integer.")
+        if app_refresh_interval > 21600:
+            raise Exception("Instagram's app state refresh interval is NOT allowed to be higher than 6 hours, and the lower the better!")
+
+        if just_logged_in:
+            self.opening_app_activity()
+        else:
+            # Act like a real logged in app client refreshing its news timeline.
+            # This also lets us detect if we're still logged in with a valid session.
+            self.getTimelineFeed()
+            if self.LastResponse.status_code != 200:
+                self.login2(self.username, self.password, True, app_refresh_interval)
+
+            last_login = self.last_login
+            if not last_login or time.time() - last_login > app_refresh_interval:
+                self.last_login = time.time()
+                # Generate and save new application session ID
+                self.session_id = self.generateUUID(True)
+                self.opening_app_activity()
+
+            last_experiments_time = self.last_experiments_time
+
+            if not isinstance(last_experiments_time, int) or time.time - last_experiments_time > config.EXPERIMENTS_REFRESH:
+                self.syncFeatures()
+                self.sync_device_features()
+
+            # TODO: Save cookie jar
+
+    def sync_device_features(self, prelogin=False):
+        data = {
+            'id': self.uuid,
+            'experiments': config.LOGIN_EXPERIMENTS
+        }
+        if not prelogin:
+            data['_uuid'] = self.uuid,
+            data['_uid'] = self.user_id,
+            data['_csrftoken'] = self.token
+
+        return self.SendRequest('qe/sync/', data, True)
+
+    def opening_app_activity(self):
+        self.autoCompleteUserList()
+        self.getTimelineFeed()
+        self.syncFeatures()
+        self.getv2Inbox()
+        self.getRecentActivity()
+
+    def update_login_state(self, response):
+        if not response.get('status') != 'ok' and response.get('logged_in_user'):
+            self.logger.error('Invalid login response provided to update_login_state()')
+
+        self.isLoggedIn = True
+        self.user_id = response.get('logged_in_user').get('pk')
+        self.rank_token = "{0}_{1}".format(self.user_id, self.uuid)
+        self.last_login = time.time()
 
     def autoCompleteUserList(self):
         return self.SendRequest('friendships/autocomplete_user_list/')
@@ -546,10 +668,10 @@ class API(object):
         return 'ig_sig_key_version=' + config.SIG_KEY_VERSION + '&signed_body=' + hmac.new(
             config.IG_SIG_KEY.encode('utf-8'), data.encode('utf-8'), hashlib.sha256).hexdigest() + '.' + parsedData
 
-    def generateDeviceId(self, seed):
-        volatile_seed = "12345"
-        m = hashlib.md5()
-        m.update(seed.encode('utf-8') + volatile_seed.encode('utf-8'))
+    def generateDeviceId(self):
+        import time
+        seed = str(round(time.time() * 1000000))
+        m = hashlib.md5(seed.encode('utf-8'))
         return 'android-' + m.hexdigest()[:16]
 
     def generateUUID(self, uuid_type):
